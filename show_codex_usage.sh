@@ -485,9 +485,7 @@ draw_switch_ui() {
 
     line="${prefix}${email} [${plan_type}]"
 
-    if [[ "$is_current" == "true" ]]; then
-      line="${line} ${BOLD}${GREEN}[Current Using]${RESET}"
-    fi
+    
 
     if [[ -n "$qerr" ]]; then
       line="${line}  ${RED}${qerr}${RESET}"
@@ -497,10 +495,14 @@ draw_switch_ui() {
       p1wc="$(colorize_remaining "$p1w")"
 
       if [[ "$limit_reached" == "true" ]]; then
-        line="${line}  RL:${RED}true${RESET}  5h:${p5c}  1w:${p1wc}"
+        line="${line}  RL:${RED}true${RESET}  5h:${p5c}  1W:${p1wc}"
       else
-        line="${line}  RL:${GREEN}false${RESET}  5h:${p5c}  1w:${p1wc}"
+        line="${line}  RL:${GREEN}false${RESET}  5h:${p5c}  1W:${p1wc}"
       fi
+    fi
+
+    if [[ "$is_current" == "true" ]]; then
+      line="${line} ${BOLD}${GREEN}[Current Using]${RESET}"
     fi
 
     if [[ "$idx" -eq "$selected" ]]; then

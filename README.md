@@ -1,6 +1,10 @@
 # show-codex-usage
 
-A lightweight local shell tool to inspect Codex usage across multiple ChatGPT-authenticated accounts, and interactively switch the current account used by Codex.
+A lightweight local shell tool for inspecting Codex usage across multiple ChatGPT-authenticated accounts and switching the current account without re-authenticating.
+
+This tool is built for a very specific but common pain point: the $20 Plus plan is often not enough, while the $200 Pro plan can be overkill. For some users, 2–3 Plus accounts are the practical middle ground. But once you start doing that, account management becomes annoying fast. You forget to monitor usage limits, you hit a window unexpectedly, and switching accounts usually means logging out and logging back into Codex again.
+
+`show-codex-usage` fixes that workflow. After you sign into a new account with Codex once, run `scu` and it will automatically add or update that account in `auth-poll.json`. Later, when you run `scu switch`, it simply swaps the selected account entry into `auth.json`. That means no repeated Codex login flow, no unnecessary friction, and a much faster way to rotate between accounts based on actual remaining usage.
 
 It reads your local Codex auth files, refreshes an auth pool automatically, queries usage data from the Codex usage endpoint, renders a clean terminal view, and optionally lets you switch the active account through a simple keyboard-driven TUI.
 
@@ -15,8 +19,14 @@ curl -fsSL https://raw.githubusercontent.com/nick-ma/show-codex-usage/main/insta
 Then use:
 
 ```bash
+# check usage data for all account profile
 show-codex-usage
+# or
 scu
+
+
+# swtich account auth profile
+scu switch
 ```
 
 ---
@@ -243,12 +253,12 @@ When confirmed, the selected account object from `auth-poll.json` is written to:
 Codex usage from: /Users/nick/.codex/auth-poll.json
 Current auth: /Users/nick/.codex/auth.json
 
-Account: june.ma0810@gmail.com [plus] [Current Using]
+Account: jaaaa-08908@gmail.com [plus] [Current Using]
 Rate Limit: false
   5h remaining: 71%  reset at: 4hr 12m (2026-03-17 15:40 UTC)
   1w remaining: 1%   reset at: 1d 8hr (2026-03-18 19:48 UTC)
 
-Account: honeyday.mj@gmail.com [plus]
+Account: nick-998892@gmail.com [plus]
 Rate Limit: false
   5h remaining: 98%  reset at: 3hr 44m (2026-03-17 15:12 UTC)
   1w remaining: 73%  reset at: 5d 14hr (2026-03-22 21:26 UTC)
@@ -259,8 +269,8 @@ Rate Limit: false
 ```text
 Select account to switch (↑/↓ move, Enter confirm, q quit)
 
-> june.ma0810@gmail.com [plus] [Current Using]  RL:false  5h:71%  1w:1%
-  honeyday.mj@gmail.com [plus]                  RL:false  5h:98%  1w:73%
+> jaaaa-08908@gmail.com [plus] [Current Using]  RL:false  5h:71%  1w:1%
+  nick-998892@gmail.com [plus]                  RL:false  5h:98%  1w:73%
 
 Current auth file: /Users/nick/.codex/auth.json
 Auth pool file: /Users/nick/.codex/auth-poll.json
