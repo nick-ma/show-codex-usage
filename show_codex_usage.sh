@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="V1.2.0"
+VERSION="1.1.1"
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 
@@ -57,11 +57,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ----------------------------
-# Auth helpers
-# ----------------------------
 get_auth_mode() {
-  jq -r '.auth_mode // "unknown"' <<<"$1"
+  jq -r '.auth_mode // "apikey"' <<<"$1"
 }
 
 get_auth_identity() {
@@ -118,7 +115,7 @@ validate_current_auth_file() {
     type == "object"
     and (
       (
-        .auth_mode == "chatgpt"
+        (.auth_mode // "apikey") == "chatgpt"
         and .tokens
         and .tokens.account_id
         and (.tokens.account_id | type == "string")
@@ -126,7 +123,7 @@ validate_current_auth_file() {
       )
       or
       (
-        .auth_mode == "apikey"
+        (.auth_mode // "apikey") == "apikey"
         and .OPENAI_API_KEY
         and (.OPENAI_API_KEY | type == "string")
         and (.OPENAI_API_KEY | length > 0)
@@ -135,9 +132,6 @@ validate_current_auth_file() {
   ' "$CURRENT_AUTH_FILE" > /dev/null
 }
 
-# ----------------------------
-# Upsert current auth.json into auth-poll.json
-# ----------------------------
 if [[ ! -f "$CURRENT_AUTH_FILE" ]]; then
   echo "Error: current auth file not found: $CURRENT_AUTH_FILE" >&2
   exit 1
@@ -154,9 +148,9 @@ TMP_UPSERT_FILE="$(mktemp)"
 
 jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
   def auth_identity($a):
-    if ($a.auth_mode // "") == "chatgpt" then
+    if (($a.auth_mode // "apikey")) == "chatgpt" then
       ($a.tokens.account_id // "")
-    elif ($a.auth_mode // "") == "apikey" then
+    elif (($a.auth_mode // "apikey")) == "apikey" then
       ($a.OPENAI_API_KEY // "")
     else
       ""
@@ -191,9 +185,6 @@ if [[ ! -f "$AUTH_FILE" ]]; then
   exit 1
 fi
 
-# ----------------------------
-# Time / formatting helpers
-# ----------------------------
 is_number() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
@@ -320,17 +311,29 @@ colorize_remaining() {
   '
 }
 
-# ----------------------------
-# Usage fetching
-# ----------------------------
+http_error_text() {
+  local code="${1:-}"
+  case "$code" in
+    401) echo "HTTP 401 Unauthorized" ;;
+    403) echo "HTTP 403 Forbidden" ;;
+    404) echo "HTTP 404 Not Found" ;;
+    429) echo "HTTP 429 Too Many Requests" ;;
+    500) echo "HTTP 500 Internal Server Error" ;;
+    502) echo "HTTP 502 Bad Gateway" ;;
+    503) echo "HTTP 503 Service Unavailable" ;;
+    *) echo "HTTP $code" ;;
+  esac
+}
+
 fetch_usage_for_account() {
   local raw_account="$1"
-  local auth_mode identity display_name is_current response
+  local auth_mode identity display_name is_current
   local access_token account_id email plan_type limit_reached
   local primary_used primary_reset secondary_used secondary_reset
   local primary_remaining secondary_remaining
   local primary_reset_fmt secondary_reset_fmt
   local primary_remaining_num
+  local response_body http_code tmp_body
 
   auth_mode="$(get_auth_mode "$raw_account")"
   identity="$(get_auth_identity "$raw_account")"
@@ -338,7 +341,6 @@ fetch_usage_for_account() {
   is_current="false"
   is_current_auth "$raw_account" && is_current="true"
 
-  # apikey auth: included in pool and switchable, but no usage check
   if [[ "$auth_mode" == "apikey" ]]; then
     jq -n \
       --arg auth_mode "$auth_mode" \
@@ -394,8 +396,12 @@ fetch_usage_for_account() {
     return
   fi
 
-  response="$(
-    curl -sS "$USAGE_URL" \
+  tmp_body="$(mktemp)"
+  http_code="$(
+    curl -sS \
+      -o "$tmp_body" \
+      -w '%{http_code}' \
+      "$USAGE_URL" \
       -H 'accept: */*' \
       -H 'accept-language: en-GB,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,en-US;q=0.6,ja;q=0.5' \
       -H "authorization: Bearer $access_token" \
@@ -415,10 +421,39 @@ fetch_usage_for_account() {
       -H 'sec-fetch-site: same-origin' \
       -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36' \
       -H 'x-openai-target-path: /backend-api/wham/usage' \
-      || true
+      || echo "000"
   )"
+  response_body="$(cat "$tmp_body" 2>/dev/null || true)"
+  rm -f "$tmp_body"
 
-  if [[ -z "$response" ]] || ! jq -e . >/dev/null 2>&1 <<<"$response"; then
+  if [[ "$http_code" != "200" ]]; then
+    jq -n \
+      --arg auth_mode "$auth_mode" \
+      --arg account_id "$account_id" \
+      --arg identity "$identity" \
+      --arg is_current "$is_current" \
+      --arg query_error "$(http_error_text "$http_code")" \
+      --arg raw_auth "$(jq -c . <<<"$raw_account")" \
+      '{
+        auth_mode: $auth_mode,
+        account_id: $account_id,
+        identity: $identity,
+        is_current: ($is_current == "true"),
+        email: $account_id,
+        plan_type: "unknown",
+        limit_reached: "error",
+        primary_remaining_num: 9999,
+        primary_remaining: "-",
+        primary_reset_fmt: "-",
+        secondary_remaining: "-",
+        secondary_reset_fmt: "-",
+        query_error: $query_error,
+        raw_auth: ($raw_auth | fromjson)
+      }'
+    return
+  fi
+
+  if [[ -z "$response_body" ]] || ! jq -e . >/dev/null 2>&1 <<<"$response_body"; then
     jq -n \
       --arg auth_mode "$auth_mode" \
       --arg account_id "$account_id" \
@@ -438,7 +473,7 @@ fetch_usage_for_account() {
         primary_reset_fmt: "-",
         secondary_remaining: "-",
         secondary_reset_fmt: "-",
-        query_error: "unable to query",
+        query_error: "invalid response body",
         raw_auth: ($raw_auth | fromjson)
       }'
     return
@@ -451,7 +486,7 @@ fetch_usage_for_account() {
     .viewer.email //
     .account_email //
     "unknown"
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   plan_type="$(jq -r '
     .plan_type //
@@ -459,37 +494,37 @@ fetch_usage_for_account() {
     .subscription.plan_type //
     .plan.type //
     "unknown"
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   limit_reached="$(jq -r '
     .rate_limit.limit_reached //
     .limit_reached //
     false
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   primary_used="$(jq -r '
     .rate_limit.primary_window.used_percent //
     .primary_window.used_percent //
     "-"
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   primary_reset="$(jq -r '
     .rate_limit.primary_window.reset_at //
     .primary_window.reset_at //
     empty
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   secondary_used="$(jq -r '
     .rate_limit.secondary_window.used_percent //
     .secondary_window.used_percent //
     "-"
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   secondary_reset="$(jq -r '
     .rate_limit.secondary_window.reset_at //
     .secondary_window.reset_at //
     empty
-  ' <<<"$response")"
+  ' <<<"$response_body")"
 
   primary_remaining="$(remaining_percent "$primary_used")"
   secondary_remaining="$(remaining_percent "$secondary_used")"
@@ -562,24 +597,23 @@ render_show_mode() {
     secondary_reset_fmt="$(jq -r '.secondary_reset_fmt' <<<"$item")"
     is_current="$(jq -r '.is_current' <<<"$item")"
     query_error="$(jq -r '.query_error // empty' <<<"$item")"
-    auth_mode="$(jq -r '.auth_mode // "unknown"' <<<"$item")"
+    auth_mode="$(jq -r '.auth_mode // "apikey"' <<<"$item")"
 
     primary_remaining_colored="$(colorize_remaining "$primary_remaining")"
     secondary_remaining_colored="$(colorize_remaining "$secondary_remaining")"
 
     if [[ "$is_current" == "true" ]]; then
-      printf "Account: %s [%s] (%s) ${BOLD}${GREEN}[Current Using]${RESET}\n" "$email" "$plan_type" "$auth_mode"
+      printf "Account: %s [%s] (%s) ${BOLD}${GREEN}[Current Using]${RESET}" "$email" "$plan_type" "$auth_mode"
     else
-      printf "Account: %s [%s] (%s)\n" "$email" "$plan_type" "$auth_mode"
+      printf "Account: %s [%s] (%s)" "$email" "$plan_type" "$auth_mode"
     fi
 
     if [[ -n "$query_error" ]]; then
-      if [[ "$auth_mode" == "apikey" ]]; then
-        printf "Rate Limit: ${BLUE}%s${RESET}\n\n" "$query_error"
-      else
-        printf "Rate Limit: ${RED}%s${RESET}\n\n" "$query_error"
-      fi
+      printf "  ${RED}%s${RESET}\n" "$query_error"
+      printf "\n"
       continue
+    else
+      printf "\n"
     fi
 
     if [[ "$limit_reached" == "true" ]]; then
@@ -616,21 +650,15 @@ draw_switch_ui() {
     p5="$(jq -r '.primary_remaining' <<<"$item")"
     p1w="$(jq -r '.secondary_remaining' <<<"$item")"
     qerr="$(jq -r '.query_error // empty' <<<"$item")"
-    auth_mode="$(jq -r '.auth_mode // "unknown"' <<<"$item")"
+    auth_mode="$(jq -r '.auth_mode // "apikey"' <<<"$item")"
 
     prefix="  "
     [[ "$idx" -eq "$selected" ]] && prefix="> "
 
     line="${prefix}${email} [${plan_type}] (${auth_mode})"
 
-    
-
     if [[ -n "$qerr" ]]; then
-      if [[ "$auth_mode" == "apikey" ]]; then
-        line="${line}  ${BLUE}${qerr}${RESET}"
-      else
-        line="${line}  ${RED}${qerr}${RESET}"
-      fi
+      line="${line}  ${RED}${qerr}${RESET}"
     else
       local p5c p1wc
       p5c="$(colorize_remaining "$p5")"
@@ -712,9 +740,6 @@ switch_mode() {
   done
 }
 
-# ----------------------------
-# Main
-# ----------------------------
 build_results
 
 if [[ "$MODE" == "switch" ]]; then
