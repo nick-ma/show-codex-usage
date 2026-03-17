@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="V1.1.0"
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 
 MODE="show"
@@ -8,6 +9,10 @@ AUTH_FILE="$HOME/.codex/auth-poll.json"
 
 if [[ $# -ge 1 ]]; then
   case "$1" in
+    version|--version|-v)
+      printf "%s\n" "$VERSION"
+      exit 0
+      ;;
     switch)
       MODE="switch"
       shift
