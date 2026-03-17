@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="V1.1.0"
+VERSION="V1.2.0"
+
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 
 MODE="show"
@@ -34,6 +35,7 @@ USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
+BLUE='\033[34m'
 BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
@@ -56,6 +58,84 @@ cleanup() {
 trap cleanup EXIT
 
 # ----------------------------
+# Auth helpers
+# ----------------------------
+get_auth_mode() {
+  jq -r '.auth_mode // "unknown"' <<<"$1"
+}
+
+get_auth_identity() {
+  local raw="$1"
+  local mode
+  mode="$(get_auth_mode "$raw")"
+
+  case "$mode" in
+    chatgpt)
+      jq -r '.tokens.account_id // empty' <<<"$raw"
+      ;;
+    apikey)
+      jq -r '.OPENAI_API_KEY // empty' <<<"$raw"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+get_auth_label() {
+  local raw="$1"
+  local mode
+  mode="$(get_auth_mode "$raw")"
+
+  case "$mode" in
+    chatgpt)
+      jq -r '.tokens.account_id // "unknown-account"' <<<"$raw"
+      ;;
+    apikey)
+      local key
+      key="$(jq -r '.OPENAI_API_KEY // ""' <<<"$raw")"
+      if [[ -z "$key" ]]; then
+        echo "unknown-apikey"
+      else
+        printf "apikey:%s...%s" "${key:0:8}" "${key: -4}"
+      fi
+      ;;
+    *)
+      echo "unknown-auth"
+      ;;
+  esac
+}
+
+is_current_auth() {
+  local raw="$1"
+  local id
+  id="$(get_auth_identity "$raw")"
+  [[ -n "$id" && "$id" == "$CURRENT_AUTH_IDENTITY" ]]
+}
+
+validate_current_auth_file() {
+  jq -e '
+    type == "object"
+    and (
+      (
+        .auth_mode == "chatgpt"
+        and .tokens
+        and .tokens.account_id
+        and (.tokens.account_id | type == "string")
+        and (.tokens.account_id | length > 0)
+      )
+      or
+      (
+        .auth_mode == "apikey"
+        and .OPENAI_API_KEY
+        and (.OPENAI_API_KEY | type == "string")
+        and (.OPENAI_API_KEY | length > 0)
+      )
+    )
+  ' "$CURRENT_AUTH_FILE" > /dev/null
+}
+
+# ----------------------------
 # Upsert current auth.json into auth-poll.json
 # ----------------------------
 if [[ ! -f "$CURRENT_AUTH_FILE" ]]; then
@@ -67,25 +147,29 @@ if [[ ! -f "$POOL_FILE" ]]; then
   echo '[]' > "$POOL_FILE"
 fi
 
-jq -e '
-  type == "object"
-  and .tokens
-  and .tokens.account_id
-  and (.tokens.account_id | type == "string")
-  and (.tokens.account_id | length > 0)
-' "$CURRENT_AUTH_FILE" > /dev/null
-
+validate_current_auth_file
 jq -e 'type == "array"' "$POOL_FILE" > /dev/null
 
 TMP_UPSERT_FILE="$(mktemp)"
 
 jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
+  def auth_identity($a):
+    if ($a.auth_mode // "") == "chatgpt" then
+      ($a.tokens.account_id // "")
+    elif ($a.auth_mode // "") == "apikey" then
+      ($a.OPENAI_API_KEY // "")
+    else
+      ""
+    end;
+
   . as $pool
   | $new_auth[0] as $new
-  | $new.tokens.account_id as $account_id
-  | if any($pool[]?; .tokens.account_id == $account_id) then
+  | auth_identity($new) as $new_id
+  | if ($new_id | length) == 0 then
+      .
+    elif any($pool[]?; auth_identity(.) == $new_id) then
       map(
-        if .tokens.account_id == $account_id
+        if auth_identity(.) == $new_id
         then $new
         else .
         end
@@ -98,7 +182,9 @@ jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
 mv "$TMP_UPSERT_FILE" "$POOL_FILE"
 unset TMP_UPSERT_FILE
 
-CURRENT_ACCOUNT_ID="$(jq -r '.tokens.account_id' "$CURRENT_AUTH_FILE")"
+CURRENT_AUTH_RAW="$(cat "$CURRENT_AUTH_FILE")"
+CURRENT_AUTH_MODE="$(get_auth_mode "$CURRENT_AUTH_RAW")"
+CURRENT_AUTH_IDENTITY="$(get_auth_identity "$CURRENT_AUTH_RAW")"
 
 if [[ ! -f "$AUTH_FILE" ]]; then
   echo "Error: auth pool file not found: $AUTH_FILE" >&2
@@ -106,7 +192,7 @@ if [[ ! -f "$AUTH_FILE" ]]; then
 fi
 
 # ----------------------------
-# Helpers
+# Time / formatting helpers
 # ----------------------------
 is_number() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
@@ -234,28 +320,65 @@ colorize_remaining() {
   '
 }
 
+# ----------------------------
+# Usage fetching
+# ----------------------------
 fetch_usage_for_account() {
   local raw_account="$1"
-
-  local access_token account_id is_current response
-  local email plan_type limit_reached
+  local auth_mode identity display_name is_current response
+  local access_token account_id email plan_type limit_reached
   local primary_used primary_reset secondary_used secondary_reset
   local primary_remaining secondary_remaining
   local primary_reset_fmt secondary_reset_fmt
   local primary_remaining_num
 
-  access_token="$(jq -r '.tokens.access_token // empty' <<<"$raw_account")"
-  account_id="$(jq -r '.tokens.account_id // "unknown-account"' <<<"$raw_account")"
+  auth_mode="$(get_auth_mode "$raw_account")"
+  identity="$(get_auth_identity "$raw_account")"
+  display_name="$(get_auth_label "$raw_account")"
   is_current="false"
-  [[ "$account_id" == "$CURRENT_ACCOUNT_ID" ]] && is_current="true"
+  is_current_auth "$raw_account" && is_current="true"
 
-  if [[ -z "$access_token" ]]; then
+  # apikey auth: included in pool and switchable, but no usage check
+  if [[ "$auth_mode" == "apikey" ]]; then
     jq -n \
-      --arg account_id "$account_id" \
+      --arg auth_mode "$auth_mode" \
+      --arg account_id "$display_name" \
+      --arg identity "$identity" \
       --arg is_current "$is_current" \
       --arg raw_auth "$(jq -c . <<<"$raw_account")" \
       '{
+        auth_mode: $auth_mode,
         account_id: $account_id,
+        identity: $identity,
+        is_current: ($is_current == "true"),
+        email: $account_id,
+        plan_type: "apikey",
+        limit_reached: "n/a",
+        primary_remaining_num: 9998,
+        primary_remaining: "-",
+        primary_reset_fmt: "-",
+        secondary_remaining: "-",
+        secondary_reset_fmt: "-",
+        query_error: "usage check skipped for apikey auth",
+        raw_auth: ($raw_auth | fromjson)
+      }'
+    return
+  fi
+
+  access_token="$(jq -r '.tokens.access_token // empty' <<<"$raw_account")"
+  account_id="$(jq -r '.tokens.account_id // "unknown-account"' <<<"$raw_account")"
+
+  if [[ -z "$access_token" ]]; then
+    jq -n \
+      --arg auth_mode "$auth_mode" \
+      --arg account_id "$account_id" \
+      --arg identity "$identity" \
+      --arg is_current "$is_current" \
+      --arg raw_auth "$(jq -c . <<<"$raw_account")" \
+      '{
+        auth_mode: $auth_mode,
+        account_id: $account_id,
+        identity: $identity,
         is_current: ($is_current == "true"),
         email: $account_id,
         plan_type: "unknown",
@@ -297,11 +420,15 @@ fetch_usage_for_account() {
 
   if [[ -z "$response" ]] || ! jq -e . >/dev/null 2>&1 <<<"$response"; then
     jq -n \
+      --arg auth_mode "$auth_mode" \
       --arg account_id "$account_id" \
+      --arg identity "$identity" \
       --arg is_current "$is_current" \
       --arg raw_auth "$(jq -c . <<<"$raw_account")" \
       '{
+        auth_mode: $auth_mode,
         account_id: $account_id,
+        identity: $identity,
         is_current: ($is_current == "true"),
         email: $account_id,
         plan_type: "unknown",
@@ -375,7 +502,9 @@ fetch_usage_for_account() {
   fi
 
   jq -n \
+    --arg auth_mode "$auth_mode" \
     --arg account_id "$account_id" \
+    --arg identity "$identity" \
     --arg is_current "$is_current" \
     --arg email "$email" \
     --arg plan_type "$plan_type" \
@@ -387,7 +516,9 @@ fetch_usage_for_account() {
     --arg secondary_reset_fmt "$secondary_reset_fmt" \
     --arg raw_auth "$(jq -c . <<<"$raw_account")" \
     '{
+      auth_mode: $auth_mode,
       account_id: $account_id,
+      identity: $identity,
       is_current: ($is_current == "true"),
       email: $email,
       plan_type: $plan_type,
@@ -410,7 +541,7 @@ build_results() {
 }
 
 sort_results_to_json() {
-  jq -s 'sort_by((if .is_current then 0 else 1 end), .primary_remaining_num)' "$RESULTS_FILE"
+  jq -s 'sort_by((if .is_current then 0 else 1 end), .primary_remaining_num, .email)' "$RESULTS_FILE"
 }
 
 render_show_mode() {
@@ -420,7 +551,7 @@ render_show_mode() {
   sort_results_to_json | jq -c '.[]' | while IFS= read -r item; do
     local email plan_type limit_reached primary_remaining primary_reset_fmt
     local secondary_remaining secondary_reset_fmt is_current query_error
-    local primary_remaining_colored secondary_remaining_colored
+    local primary_remaining_colored secondary_remaining_colored auth_mode
 
     email="$(jq -r '.email' <<<"$item")"
     plan_type="$(jq -r '.plan_type' <<<"$item")"
@@ -431,18 +562,23 @@ render_show_mode() {
     secondary_reset_fmt="$(jq -r '.secondary_reset_fmt' <<<"$item")"
     is_current="$(jq -r '.is_current' <<<"$item")"
     query_error="$(jq -r '.query_error // empty' <<<"$item")"
+    auth_mode="$(jq -r '.auth_mode // "unknown"' <<<"$item")"
 
     primary_remaining_colored="$(colorize_remaining "$primary_remaining")"
     secondary_remaining_colored="$(colorize_remaining "$secondary_remaining")"
 
     if [[ "$is_current" == "true" ]]; then
-      printf "Account: %s [%s] ${BOLD}${GREEN}[Current Using]${RESET}\n" "$email" "$plan_type"
+      printf "Account: %s [%s] (%s) ${BOLD}${GREEN}[Current Using]${RESET}\n" "$email" "$plan_type" "$auth_mode"
     else
-      printf "Account: %s [%s]\n" "$email" "$plan_type"
+      printf "Account: %s [%s] (%s)\n" "$email" "$plan_type" "$auth_mode"
     fi
 
     if [[ -n "$query_error" ]]; then
-      printf "Rate Limit: ${RED}%s${RESET}\n\n" "$query_error"
+      if [[ "$auth_mode" == "apikey" ]]; then
+        printf "Rate Limit: ${BLUE}%s${RESET}\n\n" "$query_error"
+      else
+        printf "Rate Limit: ${RED}%s${RESET}\n\n" "$query_error"
+      fi
       continue
     fi
 
@@ -462,13 +598,14 @@ draw_switch_ui() {
   local selected="$1"
   local json="$2"
   local count idx
+
   count="$(jq 'length' <<<"$json")"
 
   printf "\033[H\033[J"
   printf "${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
 
   for (( idx=0; idx<count; idx++ )); do
-    local item email plan_type is_current limit_reached
+    local item email plan_type is_current limit_reached auth_mode
     local p5 p1w qerr line prefix
 
     item="$(jq -c ".[$idx]" <<<"$json")"
@@ -479,25 +616,30 @@ draw_switch_ui() {
     p5="$(jq -r '.primary_remaining' <<<"$item")"
     p1w="$(jq -r '.secondary_remaining' <<<"$item")"
     qerr="$(jq -r '.query_error // empty' <<<"$item")"
+    auth_mode="$(jq -r '.auth_mode // "unknown"' <<<"$item")"
 
     prefix="  "
     [[ "$idx" -eq "$selected" ]] && prefix="> "
 
-    line="${prefix}${email} [${plan_type}]"
+    line="${prefix}${email} [${plan_type}] (${auth_mode})"
 
     
 
     if [[ -n "$qerr" ]]; then
-      line="${line}  ${RED}${qerr}${RESET}"
+      if [[ "$auth_mode" == "apikey" ]]; then
+        line="${line}  ${BLUE}${qerr}${RESET}"
+      else
+        line="${line}  ${RED}${qerr}${RESET}"
+      fi
     else
       local p5c p1wc
       p5c="$(colorize_remaining "$p5")"
       p1wc="$(colorize_remaining "$p1w")"
 
       if [[ "$limit_reached" == "true" ]]; then
-        line="${line}  RL:${RED}true${RESET}  5h:${p5c}  1W:${p1wc}"
+        line="${line}  RL:${RED}true${RESET}  5h:${p5c}  1w:${p1wc}"
       else
-        line="${line}  RL:${GREEN}false${RESET}  5h:${p5c}  1W:${p1wc}"
+        line="${line}  RL:${GREEN}false${RESET}  5h:${p5c}  1w:${p1wc}"
       fi
     fi
 
@@ -517,7 +659,7 @@ draw_switch_ui() {
 }
 
 switch_mode() {
-  local sorted_json selected count key item target_account_id
+  local sorted_json selected count key item target_label
   sorted_json="$(sort_results_to_json)"
   count="$(jq 'length' <<<"$sorted_json")"
 
@@ -544,11 +686,14 @@ switch_mode() {
       printf "Switching current account...\n"
 
       jq '.raw_auth' <<<"$item" > "$CURRENT_AUTH_FILE"
-      CURRENT_ACCOUNT_ID="$(jq -r '.tokens.account_id' "$CURRENT_AUTH_FILE")"
-      target_account_id="$(jq -r '.account_id' <<<"$item")"
+
+      CURRENT_AUTH_RAW="$(cat "$CURRENT_AUTH_FILE")"
+      CURRENT_AUTH_MODE="$(get_auth_mode "$CURRENT_AUTH_RAW")"
+      CURRENT_AUTH_IDENTITY="$(get_auth_identity "$CURRENT_AUTH_RAW")"
+      target_label="$(jq -r '.email' <<<"$item")"
 
       printf "${GREEN}${BOLD}Switched.${RESET}\n"
-      printf "Current account_id: %s\n" "$target_account_id"
+      printf "Current account: %s\n" "$target_label"
       printf "Updated auth file: %s\n" "$CURRENT_AUTH_FILE"
       break
     fi
