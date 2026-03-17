@@ -2,7 +2,27 @@
 set -euo pipefail
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
-AUTH_FILE="${1:-$HOME/.codex/auth-poll.json}"
+
+MODE="show"
+AUTH_FILE="$HOME/.codex/auth-poll.json"
+
+if [[ $# -ge 1 ]]; then
+  case "$1" in
+    switch)
+      MODE="switch"
+      shift
+      ;;
+    show)
+      MODE="show"
+      shift
+      ;;
+  esac
+fi
+
+if [[ $# -ge 1 ]]; then
+  AUTH_FILE="$1"
+fi
+
 POOL_FILE="$AUTH_FILE"
 USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
 
@@ -12,6 +32,7 @@ YELLOW='\033[33m'
 BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
+REVERSE='\033[7m'
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "Error: jq is required but not installed." >&2
@@ -22,6 +43,12 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "Error: curl is required but not installed." >&2
   exit 1
 fi
+
+cleanup() {
+  [[ -n "${TMP_UPSERT_FILE:-}" && -f "${TMP_UPSERT_FILE:-}" ]] && rm -f "$TMP_UPSERT_FILE"
+  [[ -n "${RESULTS_FILE:-}" && -f "${RESULTS_FILE:-}" ]] && rm -f "$RESULTS_FILE"
+}
+trap cleanup EXIT
 
 # ----------------------------
 # Upsert current auth.json into auth-poll.json
@@ -45,7 +72,7 @@ jq -e '
 
 jq -e 'type == "array"' "$POOL_FILE" > /dev/null
 
-TMP_FILE="$(mktemp)"
+TMP_UPSERT_FILE="$(mktemp)"
 
 jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
   . as $pool
@@ -61,9 +88,10 @@ jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
     else
       . + [$new]
     end
-' "$POOL_FILE" > "$TMP_FILE"
+' "$POOL_FILE" > "$TMP_UPSERT_FILE"
 
-mv "$TMP_FILE" "$POOL_FILE"
+mv "$TMP_UPSERT_FILE" "$POOL_FILE"
+unset TMP_UPSERT_FILE
 
 CURRENT_ACCOUNT_ID="$(jq -r '.tokens.account_id' "$CURRENT_AUTH_FILE")"
 
@@ -73,7 +101,7 @@ if [[ ! -f "$AUTH_FILE" ]]; then
 fi
 
 # ----------------------------
-# Helper functions
+# Helpers
 # ----------------------------
 is_number() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
@@ -201,14 +229,18 @@ colorize_remaining() {
   '
 }
 
-# ----------------------------
-# Collect all results first, then sort
-# ----------------------------
-RESULTS_FILE="$(mktemp)"
+fetch_usage_for_account() {
+  local raw_account="$1"
 
-jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
-  access_token="$(jq -r '.tokens.access_token // empty' <<<"$account")"
-  account_id="$(jq -r '.tokens.account_id // "unknown-account"' <<<"$account")"
+  local access_token account_id is_current response
+  local email plan_type limit_reached
+  local primary_used primary_reset secondary_used secondary_reset
+  local primary_remaining secondary_remaining
+  local primary_reset_fmt secondary_reset_fmt
+  local primary_remaining_num
+
+  access_token="$(jq -r '.tokens.access_token // empty' <<<"$raw_account")"
+  account_id="$(jq -r '.tokens.account_id // "unknown-account"' <<<"$raw_account")"
   is_current="false"
   [[ "$account_id" == "$CURRENT_ACCOUNT_ID" ]] && is_current="true"
 
@@ -216,6 +248,7 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
     jq -n \
       --arg account_id "$account_id" \
       --arg is_current "$is_current" \
+      --arg raw_auth "$(jq -c . <<<"$raw_account")" \
       '{
         account_id: $account_id,
         is_current: ($is_current == "true"),
@@ -227,10 +260,10 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
         primary_reset_fmt: "-",
         secondary_remaining: "-",
         secondary_reset_fmt: "-",
-        query_error: "missing access_token"
-      }' >> "$RESULTS_FILE"
-    echo >> "$RESULTS_FILE"
-    continue
+        query_error: "missing access_token",
+        raw_auth: ($raw_auth | fromjson)
+      }'
+    return
   fi
 
   response="$(
@@ -261,6 +294,7 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
     jq -n \
       --arg account_id "$account_id" \
       --arg is_current "$is_current" \
+      --arg raw_auth "$(jq -c . <<<"$raw_account")" \
       '{
         account_id: $account_id,
         is_current: ($is_current == "true"),
@@ -272,10 +306,10 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
         primary_reset_fmt: "-",
         secondary_remaining: "-",
         secondary_reset_fmt: "-",
-        query_error: "unable to query"
-      }' >> "$RESULTS_FILE"
-    echo >> "$RESULTS_FILE"
-    continue
+        query_error: "unable to query",
+        raw_auth: ($raw_auth | fromjson)
+      }'
+    return
   fi
 
   email="$(jq -r '
@@ -327,7 +361,6 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
 
   primary_remaining="$(remaining_percent "$primary_used")"
   secondary_remaining="$(remaining_percent "$secondary_used")"
-
   primary_reset_fmt="$(format_reset_at "$primary_reset")"
   secondary_reset_fmt="$(format_reset_at "$secondary_reset")"
 
@@ -347,6 +380,7 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
     --arg primary_reset_fmt "$primary_reset_fmt" \
     --arg secondary_remaining "$secondary_remaining" \
     --arg secondary_reset_fmt "$secondary_reset_fmt" \
+    --arg raw_auth "$(jq -c . <<<"$raw_account")" \
     '{
       account_id: $account_id,
       is_current: ($is_current == "true"),
@@ -357,48 +391,182 @@ jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
       primary_remaining: $primary_remaining,
       primary_reset_fmt: $primary_reset_fmt,
       secondary_remaining: $secondary_remaining,
-      secondary_reset_fmt: $secondary_reset_fmt
-    }' >> "$RESULTS_FILE"
-  echo >> "$RESULTS_FILE"
-done
+      secondary_reset_fmt: $secondary_reset_fmt,
+      raw_auth: ($raw_auth | fromjson)
+    }'
+}
 
-printf "${DIM}Codex usage from: %s${RESET}\n" "$AUTH_FILE"
-printf "${DIM}Current auth: %s${RESET}\n\n" "$CURRENT_AUTH_FILE"
+build_results() {
+  RESULTS_FILE="$(mktemp)"
+  jq -c '.[]' "$AUTH_FILE" | while IFS= read -r account; do
+    fetch_usage_for_account "$account" >> "$RESULTS_FILE"
+    echo >> "$RESULTS_FILE"
+  done
+}
 
-jq -s 'sort_by((if .is_current then 0 else 1 end), .primary_remaining_num)' "$RESULTS_FILE" | jq -c '.[]' | while IFS= read -r item; do
-  email="$(jq -r '.email' <<<"$item")"
-  plan_type="$(jq -r '.plan_type' <<<"$item")"
-  limit_reached="$(jq -r '.limit_reached' <<<"$item")"
-  primary_remaining="$(jq -r '.primary_remaining' <<<"$item")"
-  primary_reset_fmt="$(jq -r '.primary_reset_fmt' <<<"$item")"
-  secondary_remaining="$(jq -r '.secondary_remaining' <<<"$item")"
-  secondary_reset_fmt="$(jq -r '.secondary_reset_fmt' <<<"$item")"
-  is_current="$(jq -r '.is_current' <<<"$item")"
-  query_error="$(jq -r '.query_error // empty' <<<"$item")"
+sort_results_to_json() {
+  jq -s 'sort_by((if .is_current then 0 else 1 end), .primary_remaining_num)' "$RESULTS_FILE"
+}
 
-  primary_remaining_colored="$(colorize_remaining "$primary_remaining")"
-  secondary_remaining_colored="$(colorize_remaining "$secondary_remaining")"
+render_show_mode() {
+  printf "${DIM}Codex usage from: %s${RESET}\n" "$AUTH_FILE"
+  printf "${DIM}Current auth: %s${RESET}\n\n" "$CURRENT_AUTH_FILE"
 
-  if [[ "$is_current" == "true" ]]; then
-    printf "Account: %s [%s] ${BOLD}${GREEN}[Current Using]${RESET}\n" "$email" "$plan_type"
-  else
-    printf "Account: %s [%s]\n" "$email" "$plan_type"
+  sort_results_to_json | jq -c '.[]' | while IFS= read -r item; do
+    local email plan_type limit_reached primary_remaining primary_reset_fmt
+    local secondary_remaining secondary_reset_fmt is_current query_error
+    local primary_remaining_colored secondary_remaining_colored
+
+    email="$(jq -r '.email' <<<"$item")"
+    plan_type="$(jq -r '.plan_type' <<<"$item")"
+    limit_reached="$(jq -r '.limit_reached' <<<"$item")"
+    primary_remaining="$(jq -r '.primary_remaining' <<<"$item")"
+    primary_reset_fmt="$(jq -r '.primary_reset_fmt' <<<"$item")"
+    secondary_remaining="$(jq -r '.secondary_remaining' <<<"$item")"
+    secondary_reset_fmt="$(jq -r '.secondary_reset_fmt' <<<"$item")"
+    is_current="$(jq -r '.is_current' <<<"$item")"
+    query_error="$(jq -r '.query_error // empty' <<<"$item")"
+
+    primary_remaining_colored="$(colorize_remaining "$primary_remaining")"
+    secondary_remaining_colored="$(colorize_remaining "$secondary_remaining")"
+
+    if [[ "$is_current" == "true" ]]; then
+      printf "Account: %s [%s] ${BOLD}${GREEN}[Current Using]${RESET}\n" "$email" "$plan_type"
+    else
+      printf "Account: %s [%s]\n" "$email" "$plan_type"
+    fi
+
+    if [[ -n "$query_error" ]]; then
+      printf "Rate Limit: ${RED}%s${RESET}\n\n" "$query_error"
+      continue
+    fi
+
+    if [[ "$limit_reached" == "true" ]]; then
+      printf "Rate Limit: ${RED}%s${RESET}\n" "$limit_reached"
+    else
+      printf "Rate Limit: ${GREEN}%s${RESET}\n" "$limit_reached"
+    fi
+
+    printf "  5h remaining: %b  reset at: %s\n" "$primary_remaining_colored" "$primary_reset_fmt"
+    printf "  1w remaining: %b  reset at: %s\n" "$secondary_remaining_colored" "$secondary_reset_fmt"
+    printf "\n"
+  done
+}
+
+draw_switch_ui() {
+  local selected="$1"
+  local json="$2"
+  local count idx
+  count="$(jq 'length' <<<"$json")"
+
+  printf "\033[H\033[J"
+  printf "${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
+
+  for (( idx=0; idx<count; idx++ )); do
+    local item email plan_type is_current limit_reached
+    local p5 p1w qerr line prefix
+
+    item="$(jq -c ".[$idx]" <<<"$json")"
+    email="$(jq -r '.email' <<<"$item")"
+    plan_type="$(jq -r '.plan_type' <<<"$item")"
+    is_current="$(jq -r '.is_current' <<<"$item")"
+    limit_reached="$(jq -r '.limit_reached' <<<"$item")"
+    p5="$(jq -r '.primary_remaining' <<<"$item")"
+    p1w="$(jq -r '.secondary_remaining' <<<"$item")"
+    qerr="$(jq -r '.query_error // empty' <<<"$item")"
+
+    prefix="  "
+    [[ "$idx" -eq "$selected" ]] && prefix="> "
+
+    line="${prefix}${email} [${plan_type}]"
+
+    if [[ "$is_current" == "true" ]]; then
+      line="${line} ${BOLD}${GREEN}[Current Using]${RESET}"
+    fi
+
+    if [[ -n "$qerr" ]]; then
+      line="${line}  ${RED}${qerr}${RESET}"
+    else
+      local p5c p1wc
+      p5c="$(colorize_remaining "$p5")"
+      p1wc="$(colorize_remaining "$p1w")"
+
+      if [[ "$limit_reached" == "true" ]]; then
+        line="${line}  RL:${RED}true${RESET}  5h:${p5c}  1w:${p1wc}"
+      else
+        line="${line}  RL:${GREEN}false${RESET}  5h:${p5c}  1w:${p1wc}"
+      fi
+    fi
+
+    if [[ "$idx" -eq "$selected" ]]; then
+      printf "${REVERSE}%b${RESET}\n" "$line"
+    else
+      printf "%b\n" "$line"
+    fi
+  done
+
+  printf "\n${DIM}Current auth file: %s${RESET}\n" "$CURRENT_AUTH_FILE"
+  printf "${DIM}Auth pool file: %s${RESET}\n" "$AUTH_FILE"
+}
+
+switch_mode() {
+  local sorted_json selected count key item target_account_id
+  sorted_json="$(sort_results_to_json)"
+  count="$(jq 'length' <<<"$sorted_json")"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No accounts found in $AUTH_FILE" >&2
+    exit 1
   fi
 
-  if [[ -n "$query_error" ]]; then
-    printf "Rate Limit: ${RED}%s${RESET}\n\n" "$query_error"
-    continue
-  fi
+  selected=0
 
-  if [[ "$limit_reached" == "true" ]]; then
-    printf "Rate Limit: ${RED}%s${RESET}\n" "$limit_reached"
-  else
-    printf "Rate Limit: ${GREEN}%s${RESET}\n" "$limit_reached"
-  fi
+  while true; do
+    draw_switch_ui "$selected" "$sorted_json"
 
-  printf "  5h remaining: %b  reset at: %s\n" "$primary_remaining_colored" "$primary_reset_fmt"
-  printf "  1w remaining: %b  reset at: %s\n" "$secondary_remaining_colored" "$secondary_reset_fmt"
-  printf "\n"
-done
+    IFS= read -rsn1 key || true
 
-rm -f "$TMP_FILE" "$RESULTS_FILE" 2>/dev/null || true
+    if [[ "$key" == "q" || "$key" == "Q" ]]; then
+      printf "\nCancelled.\n"
+      break
+    fi
+
+    if [[ "$key" == "" ]]; then
+      item="$(jq -c ".[$selected]" <<<"$sorted_json")"
+      printf "\033[H\033[J"
+      printf "Switching current account...\n"
+
+      jq '.raw_auth' <<<"$item" > "$CURRENT_AUTH_FILE"
+      CURRENT_ACCOUNT_ID="$(jq -r '.tokens.account_id' "$CURRENT_AUTH_FILE")"
+      target_account_id="$(jq -r '.account_id' <<<"$item")"
+
+      printf "${GREEN}${BOLD}Switched.${RESET}\n"
+      printf "Current account_id: %s\n" "$target_account_id"
+      printf "Updated auth file: %s\n" "$CURRENT_AUTH_FILE"
+      break
+    fi
+
+    if [[ "$key" == $'\x1b' ]]; then
+      IFS= read -rsn2 key || true
+      case "$key" in
+        "[A")
+          (( selected > 0 )) && selected=$((selected - 1))
+          ;;
+        "[B")
+          (( selected < count - 1 )) && selected=$((selected + 1))
+          ;;
+      esac
+    fi
+  done
+}
+
+# ----------------------------
+# Main
+# ----------------------------
+build_results
+
+if [[ "$MODE" == "switch" ]]; then
+  switch_mode
+else
+  render_show_mode
+fi
