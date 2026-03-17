@@ -1,8 +1,23 @@
-# show_codex_usage.sh
+# show-codex-usage
 
 A lightweight local shell tool to inspect Codex usage across multiple ChatGPT-authenticated accounts, and interactively switch the current account used by Codex.
 
 It reads your local Codex auth files, refreshes an auth pool automatically, queries usage data from the Codex usage endpoint, renders a clean terminal view, and optionally lets you switch the active account through a simple keyboard-driven TUI.
+
+## Quick Install
+
+One-line install for copy/paste:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nick-ma/show-codex-usage/main/install.sh | bash && export PATH="$HOME/.local/bin:$PATH" && alias scu='show-codex-usage'
+```
+
+Then use:
+
+```bash
+show-codex-usage
+scu
+```
 
 ---
 
@@ -139,16 +154,35 @@ This script expects local Codex auth files similar to the following.
 
 ## Installation
 
-Clone or copy the script into your local machine:
+Install with one command:
 
 ```bash
-chmod +x show_codex_usage.sh
+curl -fsSL https://raw.githubusercontent.com/nick-ma/show-codex-usage/main/install.sh | bash
 ```
 
-You can place it anywhere, for example:
+The installer will:
+
+- download the main script to `~/.local/bin/show-codex-usage`
+- ensure `~/.local/bin` is added to your `PATH`
+- add `alias scu='show-codex-usage'` to your shell rc file
+
+If you want the command to be available immediately in the current shell, run:
 
 ```bash
-~/bin/show_codex_usage.sh
+export PATH="$HOME/.local/bin:$PATH" && alias scu='show-codex-usage'
+```
+
+Or reload your shell rc file:
+
+```bash
+source ~/.zshrc
+```
+
+If you use bash instead of zsh, reload the file the installer updated, or just open a new terminal. Then run:
+
+```bash
+show-codex-usage
+scu
 ```
 
 ---
@@ -158,7 +192,7 @@ You can place it anywhere, for example:
 ### Show usage
 
 ```bash
-./show_codex_usage.sh
+show-codex-usage
 ```
 
 This uses:
@@ -169,7 +203,7 @@ This uses:
 You can also specify a custom pool file:
 
 ```bash
-./show_codex_usage.sh /path/to/auth-poll.json
+show-codex-usage /path/to/auth-poll.json
 ```
 
 ---
@@ -177,13 +211,13 @@ You can also specify a custom pool file:
 ### Switch current account
 
 ```bash
-./show_codex_usage.sh switch
+show-codex-usage switch
 ```
 
 Or with a custom pool file:
 
 ```bash
-./show_codex_usage.sh switch /path/to/auth-poll.json
+show-codex-usage switch /path/to/auth-poll.json
 ```
 
 Interactive controls:
@@ -337,4 +371,3 @@ project/
 ## License
 
 MIT
-
