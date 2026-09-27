@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 
@@ -723,6 +723,17 @@ switch_mode() {
       printf "${GREEN}${BOLD}Switched.${RESET}\n"
       printf "Current account: %s\n" "$target_label"
       printf "Updated auth file: %s\n" "$CURRENT_AUTH_FILE"
+
+      if command -v codex >/dev/null 2>&1; then
+        printf "Restarting codex app-server daemon...\n"
+        if codex app-server daemon restart >/dev/null 2>&1; then
+          printf "${GREEN}Daemon restarted.${RESET}\n"
+        else
+          printf "${DIM}Warning: failed to restart codex app-server daemon.${RESET}\n"
+        fi
+      else
+        printf "${DIM}Warning: codex CLI not found, skipping daemon restart.${RESET}\n"
+      fi
       break
     fi
 
